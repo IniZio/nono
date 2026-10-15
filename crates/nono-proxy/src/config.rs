@@ -116,6 +116,14 @@ pub struct ProxyConfig {
     #[serde(default, skip)]
     pub oauth_capture_store_path: Option<PathBuf>,
 
+    /// PEM CA certificate file paths trusted for every upstream connection.
+    ///
+    /// Added to the default upstream root store, so passthrough and
+    /// intercepted requests without a route-specific `tls_ca` also trust
+    /// them. Needed when an upstream hop re-signs TLS with a private CA.
+    #[serde(default)]
+    pub upstream_extra_ca_pems: Vec<String>,
+
     /// External (enterprise) proxy URL for passthrough mode.
     /// When set, CONNECT requests are chained to this proxy.
     #[serde(default)]
@@ -268,6 +276,7 @@ impl Default for ProxyConfig {
             routes: Vec::new(),
             oauth_capture: Vec::new(),
             oauth_capture_store_path: None,
+            upstream_extra_ca_pems: Vec::new(),
             external_proxy: None,
             direct_connect_ports: Vec::new(),
             no_proxy: Vec::new(),
@@ -2229,6 +2238,15 @@ mod tests {
         let route: RouteConfig = serde_json::from_str(json).unwrap();
         assert!(route.endpoint_rules.is_empty());
         assert!(route.tls_ca.is_none());
+    }
+
+    #[test]
+    fn test_upstream_extra_ca_pems_default_empty_and_deserializes() {
+        let config: ProxyConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.upstream_extra_ca_pems.is_empty());
+        let config: ProxyConfig =
+            serde_json::from_str(r#"{"upstream_extra_ca_pems": ["/a.pem"]}"#).unwrap();
+        assert_eq!(config.upstream_extra_ca_pems, vec!["/a.pem".to_string()]);
     }
 
     #[test]
