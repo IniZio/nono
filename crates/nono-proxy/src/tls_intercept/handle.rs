@@ -1251,8 +1251,20 @@ where
 
     // --- Read body (Content-Length only; chunked is rare in API requests
     // and matches the existing reverse-proxy contract). ---
-    let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
-    let mut filtered_headers = reverse::filter_headers(&req.header_bytes, strip_header);
+    // Passthrough (no route selected): drop the phantom credential header of
+    // the host's credential routes so it never reaches the upstream.
+    let strip_headers: Vec<String> = match (cred, service) {
+        (Some(c), _) => vec![c.proxy_header_name.clone()],
+        (None, None) => reverse::passthrough_phantom_header_names(
+            &ctx.route_store,
+            &ctx.credential_store,
+            ctx.host,
+            ctx.port,
+        ),
+        (None, Some(_)) => Vec::new(),
+    };
+    let strip_refs: Vec<&str> = strip_headers.iter().map(String::as_str).collect();
+    let mut filtered_headers = reverse::filter_headers_multi(&req.header_bytes, &strip_refs);
     if is_oauth_capture_host {
         filtered_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("accept-encoding"));
         filtered_headers.push(("Accept-Encoding".to_string(), "identity".to_string()));
@@ -1926,6 +1938,16 @@ where
         }
     };
 
+    let passthrough_strip = if service.is_none() && cred.is_none() {
+        reverse::passthrough_phantom_header_names(
+            &ctx.route_store,
+            &ctx.credential_store,
+            ctx.host,
+            ctx.port,
+        )
+    } else {
+        Vec::new()
+    };
     let upstream_authority = reverse::format_host_header(UpstreamScheme::Https, ctx.host, ctx.port);
     let request = match build_websocket_upstream_request(
         req,
@@ -1934,6 +1956,7 @@ where
         service,
         route.map_or(&[], |r| r.redeem_phantoms.as_slice()),
         ctx.nonce_resolver.as_deref(),
+        &passthrough_strip,
     ) {
         Ok(request) => request,
         Err(error) => {
@@ -2179,8 +2202,10 @@ fn build_websocket_upstream_request(
     service: Option<&str>,
     redeem_phantoms: &[String],
     nonce_resolver: Option<&dyn crate::token::NonceResolver>,
+    passthrough_strip: &[String],
 ) -> Result<Zeroizing<String>> {
-    let injected_header_names = reverse::injected_credential_header_names(cred);
+    let mut injected_header_names = reverse::injected_credential_header_names(cred);
+    injected_header_names.extend_from_slice(passthrough_strip);
     let filtered_headers =
         reverse::filter_headers_for_upgrade(&req.header_bytes, &injected_header_names)?;
     let mut request = Zeroizing::new(format!(
@@ -3363,6 +3388,7 @@ mod tests {
                 Some("other"),
                 &[],
                 Some(&resolver),
+                &[],
             )
             .is_err()
         );
@@ -3394,6 +3420,7 @@ mod tests {
             Some("chat"),
             &[],
             Some(&resolver),
+            &[],
         )
         .unwrap();
         assert!(outbound.contains("x-session: REAL\r\n"));
@@ -3452,6 +3479,7 @@ mod tests {
             Some("chat"),
             &[],
             Some(&resolver),
+            &[],
         )
         .unwrap();
         assert!(outbound.contains("authorization: Bearer sk-ant-oat01-REAL\r\n"));
@@ -3474,6 +3502,7 @@ mod tests {
                 Some("chat"),
                 &[],
                 Some(&resolver),
+                &[],
             )
             .is_err()
         );
@@ -3531,6 +3560,208 @@ mod tests {
             nonce_resolver: None,
             enable_h2: false,
         }
+    }
+
+    fn phantom_test_route(port: u16, with_credential: bool) -> crate::config::RouteConfig {
+        let mut route: crate::config::RouteConfig = serde_json::from_value(serde_json::json!({
+            "prefix": "gh",
+            "upstream": format!("https://localhost:{port}"),
+            "endpoint_rules": if with_credential {
+                serde_json::json!([{"method": "POST", "path": "/repos/mine/**"}])
+            } else {
+                serde_json::json!([])
+            },
+        }))
+        .unwrap();
+        if with_credential {
+            route.credential_key = Some("env://NONO_TEST_UNUSED".to_string());
+        }
+        route
+    }
+
+    fn phantom_test_credential_store() -> CredentialStore {
+        let mut store = CredentialStore::empty();
+        store.insert_for_test(
+            "gh".to_string(),
+            crate::credential::LoadedCredential {
+                inject_mode: crate::config::InjectMode::Header,
+                proxy_inject_mode: crate::config::InjectMode::Header,
+                raw_credential: Zeroizing::new("real".to_string()),
+                header_name: "Authorization".to_string(),
+                proxy_header_name: "Authorization".to_string(),
+                header_value: Zeroizing::new("token real".to_string()),
+                extra_headers: Vec::new(),
+                path_pattern: None,
+                proxy_path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy_query_param_name: None,
+            },
+        );
+        store
+    }
+
+    /// Drive one HTTP/1.1 request carrying `Authorization: token moor-proxy`
+    /// through `handle_inner_request` against a mock TLS upstream and return
+    /// the raw request text the upstream received.
+    async fn h1_upstream_request_text(
+        with_credential: bool,
+        credentials: CredentialStore,
+        method: &str,
+        path: &str,
+    ) -> String {
+        use rcgen::{CertificateParams, KeyPair};
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio::io::AsyncReadExt;
+
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = params.signed_by(&key_pair, ca.issuer()).unwrap();
+        let server_config = Arc::new(
+            rustls::server::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
+            )
+            .unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let upstream = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = tokio_rustls::TlsAcceptor::from(server_config)
+                .accept(tcp)
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = tls.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            tls.flush().await.unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(ca.cert_pem().as_bytes()).unwrap())
+            .unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        ));
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let filter = ProxyFilter::allow_all();
+        let route_store = RouteStore::load(&[phantom_test_route(port, with_credential)])
+            .await
+            .unwrap();
+        let mut ctx = test_intercept_ctx(&session_token, &connector, &filter);
+        ctx.host = "localhost";
+        ctx.port = port;
+        ctx.route_store = Arc::new(route_store);
+        ctx.credential_store = Arc::new(credentials);
+
+        let (mut client, mut proxy_side) = tokio::io::duplex(8192);
+        client
+            .write_all(
+                format!(
+                    "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: token moor-proxy\r\nAccept: application/json\r\nContent-Length: 0\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_inner_request(&mut proxy_side, &ctx),
+        )
+        .await
+        .expect("handle_inner_request timed out")
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), upstream)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn http1_strips_phantom_header_on_unmatched_passthrough() {
+        let seen = h1_upstream_request_text(
+            true,
+            phantom_test_credential_store(),
+            "GET",
+            "/repos/other/public",
+        )
+        .await;
+        assert!(
+            !seen.to_lowercase().contains("authorization:"),
+            "phantom Authorization must not reach upstream: {seen}"
+        );
+        assert!(seen.contains("Accept: application/json"));
+    }
+
+    #[tokio::test]
+    async fn http1_injects_real_credential_on_matched_route() {
+        let seen = h1_upstream_request_text(
+            true,
+            phantom_test_credential_store(),
+            "POST",
+            "/repos/mine/x",
+        )
+        .await;
+        assert!(seen.contains("Authorization: token real\r\n"), "{seen}");
+        assert!(!seen.contains("moor-proxy"), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn http1_keeps_client_authorization_on_host_without_credential_routes() {
+        let seen =
+            h1_upstream_request_text(false, CredentialStore::empty(), "GET", "/anything").await;
+        assert!(seen.contains("Authorization: token moor-proxy"), "{seen}");
+    }
+
+    #[test]
+    fn websocket_request_strips_passthrough_phantom_header() {
+        let request = ParsedRequest {
+            method: "GET".to_string(),
+            path: "/socket".to_string(),
+            version: "HTTP/1.1".to_string(),
+            header_bytes:
+                b"Host: chat.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nAuthorization: token moor-proxy\r\nX-Keep: 1\r\n"
+                    .to_vec(),
+            buffered: Vec::new(),
+        };
+        let outbound = build_websocket_upstream_request(
+            &request,
+            "chat.example",
+            None,
+            None,
+            &[],
+            None,
+            &["authorization".to_string()],
+        )
+        .unwrap();
+        assert!(!outbound.to_lowercase().contains("authorization"));
+        assert!(outbound.to_lowercase().contains("x-keep: 1"));
     }
 
     #[tokio::test]

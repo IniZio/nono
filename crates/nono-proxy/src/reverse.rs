@@ -2864,10 +2864,95 @@ pub(crate) fn injected_credential_header_names(cred: Option<&LoadedCredential>) 
         .unwrap_or_default()
 }
 
+/// Lowercased client-side header names that carry a phantom credential for
+/// the credential routes on `host:port`.
+///
+/// Used when an intercepted request selects no route (passthrough): the
+/// phantom value is never a real secret and must not reach the upstream,
+/// where it would turn an anonymous-OK request into a 401. Empty when the
+/// host has no header/basic-auth credential routes.
+pub(crate) fn passthrough_phantom_header_names(
+    route_store: &RouteStore,
+    credential_store: &CredentialStore,
+    host: &str,
+    port: u16,
+) -> Vec<String> {
+    let host_port = format!("{}:{}", host.to_lowercase(), port);
+    let is_header_mode =
+        |mode: &InjectMode| matches!(mode, InjectMode::Header | InjectMode::BasicAuth);
+    let mut names: Vec<String> = Vec::new();
+    for (prefix, _) in route_store.lookup_all_by_upstream(&host_port) {
+        let name = credential_store
+            .get(prefix)
+            .filter(|c| is_header_mode(&c.proxy_inject_mode))
+            .map(|c| c.proxy_header_name.as_str())
+            .or_else(|| {
+                credential_store
+                    .get_cmd(prefix)
+                    .filter(|c| is_header_mode(&c.proxy_inject_mode))
+                    .map(|c| c.proxy_header_name.as_str())
+            });
+        if let Some(name) = name.filter(|n| !n.is_empty()) {
+            let lower = name.to_lowercase();
+            if !names.contains(&lower) {
+                names.push(lower);
+            }
+        }
+    }
+    names
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn passthrough_phantom_header_names_collects_credential_route_headers() {
+        let routes: Vec<crate::config::RouteConfig> = serde_json::from_value(serde_json::json!([
+            {"prefix": "gh", "upstream": "https://api.example.com", "credential_key": "env://X"},
+            {"prefix": "other", "upstream": "https://elsewhere.example.com"},
+        ]))
+        .unwrap();
+        let route_store = RouteStore::load(&routes).await.unwrap();
+        let mut credentials = CredentialStore::empty();
+        for (prefix, header) in [("gh", "Authorization"), ("other", "X-Other")] {
+            credentials.insert_for_test(
+                prefix.to_string(),
+                LoadedCredential {
+                    inject_mode: InjectMode::Header,
+                    proxy_inject_mode: InjectMode::Header,
+                    raw_credential: Zeroizing::new("s".to_string()),
+                    header_name: header.to_string(),
+                    proxy_header_name: header.to_string(),
+                    header_value: Zeroizing::new("v".to_string()),
+                    extra_headers: Vec::new(),
+                    path_pattern: None,
+                    proxy_path_pattern: None,
+                    path_replacement: None,
+                    query_param_name: None,
+                    proxy_query_param_name: None,
+                },
+            );
+        }
+        assert_eq!(
+            passthrough_phantom_header_names(&route_store, &credentials, "API.example.com", 443),
+            vec!["authorization".to_string()]
+        );
+        assert!(
+            passthrough_phantom_header_names(&route_store, &credentials, "unknown.example", 443)
+                .is_empty()
+        );
+        assert!(
+            passthrough_phantom_header_names(
+                &route_store,
+                &CredentialStore::empty(),
+                "api.example.com",
+                443
+            )
+            .is_empty()
+        );
+    }
 
     #[test]
     fn test_endpoint_approval_request_id_is_unique() {
