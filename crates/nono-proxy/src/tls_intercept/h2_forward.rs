@@ -364,7 +364,17 @@ async fn handle_h2_stream(
     // must be stripped from the inbound request (and re-injected below) is
     // computed by the shared helper so the h2 path strips/injects exactly the
     // same headers as HTTP/1.1 — including any `extra_headers`.
-    let injected_header_names = reverse::injected_credential_header_names(cred);
+    let mut injected_header_names = reverse::injected_credential_header_names(cred);
+    // Passthrough (no route selected): also drop the phantom credential header
+    // of the host's credential routes so it never reaches the upstream.
+    if service.is_none() && cred.is_none() {
+        injected_header_names.extend(reverse::passthrough_phantom_header_names(
+            &ctx.route_store,
+            &ctx.credential_store,
+            &ctx.host,
+            ctx.port,
+        ));
+    }
     // Strip the managed-auth inject header so a client-supplied copy cannot
     // survive alongside the injected value.
     let spiffe_inject_header_lower: Option<String> =
@@ -2249,6 +2259,182 @@ mod tests {
         })
         .await;
         assert!(result.is_ok(), "test timed out — h2 forwarding hung");
+    }
+
+    /// RouteStore with one route at `host:port`. `with_credential` declares a
+    /// managed credential (so an unmatched request is dropped to passthrough);
+    /// without it the route is credential-less.
+    async fn make_phantom_route_store(
+        port: u16,
+        with_credential: bool,
+        rules: Vec<EndpointRule>,
+    ) -> RouteStore {
+        let routes = vec![RouteConfig {
+            redeem_phantoms: Vec::new(),
+            prefix: "test-svc".to_string(),
+            upstream: format!("https://localhost:{}", port),
+            credential_key: with_credential.then(|| "env://NONO_TEST_UNUSED".to_string()),
+            inject_mode: InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: rules,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+            endpoint_policy: None,
+            spiffe: None,
+            upgrades: vec![],
+            rate_limit: None,
+        }];
+        RouteStore::load(&routes).await.unwrap()
+    }
+
+    /// Send one h2 request carrying `Authorization: token moor-proxy` through
+    /// the intercept forwarder and return the headers the upstream saw.
+    async fn forwarded_headers_for(
+        route_store: RouteStore,
+        credential_store: CredentialStore,
+        upstream_port: u16,
+        rx: tokio::sync::oneshot::Receiver<(String, http::HeaderMap)>,
+        ca: Arc<EphemeralCa>,
+        method: &str,
+        path: &str,
+    ) -> http::HeaderMap {
+        use std::time::Duration;
+
+        let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+        let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let ctx = InterceptCtx {
+            route_id: Some("test-svc"),
+            host: "localhost",
+            port: upstream_port,
+            route_store: Arc::new(route_store),
+            credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
+            session_token: &session_token,
+            cert_cache,
+            tls_connector: &tls_connector,
+            tls_connector_h2: &tls_connector,
+            filter: &filter,
+            audit_log: None,
+            upstream_proxy: None,
+            approval_backends: None,
+            credential_capture_backend: None,
+            nonce_resolver: None,
+            enable_h2: true,
+        };
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let (_, headers) = tokio::time::timeout(Duration::from_secs(5), async {
+            let (_, headers) = tokio::join!(
+                async {
+                    let _ = forward_h2_connection(server_io, &ctx).await;
+                },
+                async {
+                    let (mut h2_client, h2_conn) = h2::client::handshake(client_io).await.unwrap();
+                    let conn_handle = tokio::spawn(async move {
+                        let _ = h2_conn.await;
+                    });
+                    let request = http::Request::builder()
+                        .method(method)
+                        .uri(format!("https://localhost:{}{}", upstream_port, path))
+                        .header("authorization", "token moor-proxy")
+                        .body(())
+                        .unwrap();
+                    let (response_fut, _send_stream) =
+                        h2_client.send_request(request, true).unwrap();
+                    let response = response_fut.await.unwrap();
+                    assert_eq!(response.status(), 200);
+                    let seen = rx.await.unwrap();
+                    drop(h2_client);
+                    conn_handle.abort();
+                    let _ = conn_handle.await;
+                    seen
+                }
+            );
+            ((), headers)
+        })
+        .await
+        .expect("test timed out — h2 forwarding hung");
+        headers.1
+    }
+
+    fn post_rule() -> Vec<EndpointRule> {
+        vec![EndpointRule {
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+        }]
+    }
+
+    #[tokio::test]
+    async fn h2_forward_strips_phantom_header_on_unmatched_passthrough() {
+        let ca = Arc::new(EphemeralCa::generate().unwrap());
+        let (port, rx) = spawn_mock_h2_upstream(&ca).await;
+        let route_store = make_phantom_route_store(port, true, post_rule()).await;
+        let headers = forwarded_headers_for(
+            route_store,
+            make_credential_store("sk-real"),
+            port,
+            rx,
+            ca,
+            "GET",
+            "/v1/public",
+        )
+        .await;
+        assert!(
+            headers.get("authorization").is_none(),
+            "phantom Authorization must not reach upstream: {headers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn h2_forward_injects_real_credential_on_matched_route() {
+        let ca = Arc::new(EphemeralCa::generate().unwrap());
+        let (port, rx) = spawn_mock_h2_upstream(&ca).await;
+        let route_store = make_phantom_route_store(port, true, post_rule()).await;
+        let headers = forwarded_headers_for(
+            route_store,
+            make_credential_store("sk-real"),
+            port,
+            rx,
+            ca,
+            "POST",
+            "/v1/chat/completions",
+        )
+        .await;
+        assert_eq!(
+            headers.get("authorization").map(|v| v.to_str().unwrap()),
+            Some("Bearer sk-real")
+        );
+    }
+
+    #[tokio::test]
+    async fn h2_forward_keeps_client_authorization_on_host_without_credential_routes() {
+        let ca = Arc::new(EphemeralCa::generate().unwrap());
+        let (port, rx) = spawn_mock_h2_upstream(&ca).await;
+        let route_store = make_phantom_route_store(port, false, Vec::new()).await;
+        let headers = forwarded_headers_for(
+            route_store,
+            CredentialStore::empty(),
+            port,
+            rx,
+            ca,
+            "GET",
+            "/v1/public",
+        )
+        .await;
+        assert_eq!(
+            headers.get("authorization").map(|v| v.to_str().unwrap()),
+            Some("token moor-proxy")
+        );
     }
 
     /// Build a RouteStore modeling an endpoint-only restriction route (no
