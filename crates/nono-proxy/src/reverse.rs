@@ -2003,61 +2003,42 @@ fn validate_phantom_token_basic(
 /// When `cred_header` is empty (no-credential route), all other headers
 /// including `Authorization` are passed through to the upstream.
 pub(crate) fn filter_headers_multi(header_bytes: &[u8], strip: &[&str]) -> Vec<(String, String)> {
-    let prefixes: Vec<String> = strip
-        .iter()
-        .filter(|h| !h.is_empty())
-        .map(|h| format!("{}:", h.to_lowercase()))
-        .collect();
     let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
     let mut headers = Vec::new();
     for line in header_str.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("host:")
-            || lower.starts_with("content-length:")
-            || lower.starts_with("transfer-encoding:")
-            || lower.starts_with("connection:")
-            || lower.starts_with("proxy-connection:")
-            || lower.starts_with("proxy-authorization:")
-            || prefixes.iter().any(|p| lower.starts_with(p.as_str()))
-            || line.trim().is_empty()
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if is_always_stripped_header(name)
+            || strip
+                .iter()
+                .any(|h| !h.is_empty() && name.eq_ignore_ascii_case(h.trim()))
         {
             continue;
         }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_string(), value.trim().to_string()));
-        }
+        headers.push((name.to_string(), value.trim().to_string()));
     }
     headers
 }
 
+/// Hop-by-hop and re-framed headers never forwarded upstream. `name` must be
+/// trimmed so `Host :` cannot slip past a prefix match.
+fn is_always_stripped_header(name: &str) -> bool {
+    [
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "proxy-connection",
+        "proxy-authorization",
+    ]
+    .iter()
+    .any(|h| name.eq_ignore_ascii_case(h))
+}
+
 pub(crate) fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(String, String)> {
-    let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
-    let cred_header_lower = if cred_header.is_empty() {
-        String::new()
-    } else {
-        format!("{}:", cred_header.to_lowercase())
-    };
-    let mut headers = Vec::new();
-
-    for line in header_str.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("host:")
-            || lower.starts_with("content-length:")
-            || lower.starts_with("transfer-encoding:")
-            || lower.starts_with("connection:")
-            || lower.starts_with("proxy-connection:")
-            || lower.starts_with("proxy-authorization:")
-            || (!cred_header_lower.is_empty() && lower.starts_with(&cred_header_lower))
-            || line.trim().is_empty()
-        {
-            continue;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_string(), value.trim().to_string()));
-        }
-    }
-
-    headers
+    filter_headers_multi(header_bytes, &[cred_header])
 }
 
 /// Filter headers for an outbound WebSocket upgrade request.
@@ -3278,6 +3259,13 @@ mod tests {
         let filtered = filter_headers(header, "PRIVATE-TOKEN");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].0, "Content-Type");
+    }
+
+    #[test]
+    fn test_filter_headers_multi_strips_whitespace_before_colon() {
+        let header = b"Authorization : a\r\nauthorization\t: b\r\nHost : h\r\nX-Keep: 1\r\n\r\n";
+        let filtered = filter_headers_multi(header, &["authorization"]);
+        assert_eq!(filtered, vec![("X-Keep".to_string(), "1".to_string())]);
     }
 
     #[test]

@@ -3539,6 +3539,23 @@ mod tests {
         method: &str,
         path: &str,
     ) -> String {
+        h1_upstream_request_text_with_auth(
+            "Authorization: token moor-proxy",
+            with_credential,
+            credentials,
+            method,
+            path,
+        )
+        .await
+    }
+
+    async fn h1_upstream_request_text_with_auth(
+        auth_line: &str,
+        with_credential: bool,
+        credentials: CredentialStore,
+        method: &str,
+        path: &str,
+    ) -> String {
         use rcgen::{CertificateParams, KeyPair};
         use rustls::pki_types::pem::PemObject;
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -3613,7 +3630,7 @@ mod tests {
         client
             .write_all(
                 format!(
-                    "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: token moor-proxy\r\nAccept: application/json\r\nContent-Length: 0\r\n\r\n"
+                    "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth_line}\r\nAccept: application/json\r\nContent-Length: 0\r\n\r\n"
                 )
                 .as_bytes(),
             )
@@ -3646,6 +3663,28 @@ mod tests {
             "phantom Authorization must not reach upstream: {seen}"
         );
         assert!(seen.contains("Accept: application/json"));
+    }
+
+    #[tokio::test]
+    async fn http1_strips_phantom_header_with_whitespace_before_colon() {
+        for auth_line in [
+            "Authorization : token moor-proxy",
+            "Authorization\t: token moor-proxy",
+        ] {
+            let seen = h1_upstream_request_text_with_auth(
+                auth_line,
+                true,
+                phantom_test_credential_store(),
+                "GET",
+                "/repos/other/public",
+            )
+            .await;
+            assert!(
+                !seen.to_lowercase().contains("authorization"),
+                "phantom Authorization ({auth_line:?}) must not reach upstream: {seen}"
+            );
+            assert!(seen.contains("Accept: application/json"));
+        }
     }
 
     #[tokio::test]
