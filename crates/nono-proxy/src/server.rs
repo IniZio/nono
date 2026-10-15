@@ -1059,6 +1059,33 @@ impl crate::token::NonceResolver for CompositeNonceResolver {
     }
 }
 
+/// Default upstream trust store: webpki roots, native roots, then any
+/// configured extra CA files.
+fn build_upstream_root_store(extra_ca_pems: &[String]) -> Result<rustls::RootCertStore> {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let native = rustls_native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        debug!(
+            "failed to load {} native cert(s); continuing with webpki roots + any that succeeded",
+            native.errors.len()
+        );
+    }
+    let native_count = native.certs.len();
+    for cert in native.certs {
+        if let Err(e) = root_store.add(cert) {
+            debug!("skipping unparseable native cert: {e}");
+        }
+    }
+    if native_count > 0 {
+        debug!("added {native_count} native system CA(s) to upstream trust store");
+    }
+    for ca_path in extra_ca_pems {
+        crate::route::add_ca_file_to_store(&mut root_store, ca_path)?;
+    }
+    Ok(root_store)
+}
+
 /// Start the proxy server.
 ///
 /// Binds to `config.bind_addr:config.bind_port` (port 0 = OS-assigned),
@@ -1166,24 +1193,7 @@ pub async fn start_with_nonce_resolver(
     // crypto providers are in the dependency tree.
     // Must be created before CredentialStore::load_with_diagnostics() because OAuth2 token
     // exchange needs TLS.
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let native = rustls_native_certs::load_native_certs();
-    if !native.errors.is_empty() {
-        debug!(
-            "failed to load {} native cert(s); continuing with webpki roots + any that succeeded",
-            native.errors.len()
-        );
-    }
-    let native_count = native.certs.len();
-    for cert in native.certs {
-        if let Err(e) = root_store.add(cert) {
-            debug!("skipping unparseable native cert: {e}");
-        }
-    }
-    if native_count > 0 {
-        debug!("added {native_count} native system CA(s) to upstream trust store");
-    }
+    let root_store = build_upstream_root_store(&config.upstream_extra_ca_pems)?;
     let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -2336,6 +2346,95 @@ async fn handle_forward_http(
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    async fn handshake_with_store(
+        store: rustls::RootCertStore,
+        server_ca: Arc<EphemeralCa>,
+    ) -> std::io::Result<()> {
+        use rustls::pki_types::ServerName;
+
+        #[derive(Debug)]
+        struct Fixed(Arc<rustls::sign::CertifiedKey>);
+        impl rustls::server::ResolvesServerCert for Fixed {
+            fn resolve(
+                &self,
+                _: rustls::server::ClientHello<'_>,
+            ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+                Some(Arc::clone(&self.0))
+            }
+        }
+
+        let certified = CertCache::new(server_ca).get_or_mint("localhost").unwrap();
+        let server_config = Arc::new(
+            rustls::server::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(Fixed(certified))),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let _ = tokio_rustls::TlsAcceptor::from(server_config)
+                .accept(tcp)
+                .await;
+        });
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(store)
+            .with_no_client_auth(),
+        ));
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn upstream_extra_ca_is_trusted_for_default_connector() {
+        let ca = Arc::new(EphemeralCa::generate().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extra-ca.pem");
+        std::fs::write(&path, ca.cert_pem()).unwrap();
+        let store = build_upstream_root_store(&[path.to_string_lossy().into_owned()]).unwrap();
+        handshake_with_store(store, ca)
+            .await
+            .expect("cert signed by extra CA must be accepted");
+    }
+
+    #[tokio::test]
+    async fn upstream_root_store_without_extra_ca_rejects_private_ca() {
+        let ca = Arc::new(EphemeralCa::generate().unwrap());
+        let store = build_upstream_root_store(&[]).unwrap();
+        assert!(handshake_with_store(store, ca).await.is_err());
+    }
+
+    #[test]
+    fn upstream_extra_ca_missing_file_is_config_error() {
+        let err = build_upstream_root_store(&["/nonexistent/extra-ca.pem".to_string()])
+            .expect_err("missing CA file must fail");
+        assert!(matches!(err, ProxyError::Config(_)));
+    }
+
+    #[test]
+    fn upstream_extra_ca_invalid_pem_is_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.pem");
+        std::fs::write(&path, "not a certificate").unwrap();
+        let err = build_upstream_root_store(&[path.to_string_lossy().into_owned()])
+            .expect_err("invalid CA file must fail");
+        assert!(matches!(err, ProxyError::Config(_)));
+    }
 
     fn env_value<'a>(vars: &'a [(String, String)], key: &str) -> Result<&'a str> {
         vars.iter()
