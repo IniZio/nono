@@ -180,9 +180,9 @@ Head over to the [docs](https://nono.sh/docs) and discover nono's rich composabl
 
 ## Library support
 
-nono provides FFI bindings for Rust, Python, TypeScript, and Go.
+nono provides FFI bindings for Rust and Python.
 
-Also available as [Python](https://github.com/nolabs-ai/nono-py), [TypeScript](https://github.com/nolabs-ai/nono-ts), and [Go](https://github.com/nolabs-ai/nono-go) bindings.
+Also available as [Python](https://github.com/nolabs-ai/nono-py) bindings.
 
 ## Contributing
 
