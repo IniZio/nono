@@ -218,6 +218,7 @@
           "/etc/ssl",
           "/etc/pki",
           "/etc/ca-certificates",
+          "/var/lib/ca-certificates",
           "/etc/crypto-policies",
           "/etc/fonts",
           "/etc/ld.so.cache",
