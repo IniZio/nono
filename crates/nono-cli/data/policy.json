@@ -566,10 +566,19 @@
           "~/.local/state/nix/profiles",
           "~/.nix-defexpr",
           "~/.local/state/nix/defexpr",
+          "~/.local/share/nix",
           "/run/current-system/sw",
           "/etc/profiles/per-user",
           "/nix/var/nix/profiles",
           "/nix/store"
+        ]
+      }
+    },
+    "nix_profile_state_write": {
+      "description": "Nix profile mutation - write access to the user profiles state directory",
+      "allow": {
+        "write": [
+          "~/.local/state/nix/profiles"
         ]
       }
     },

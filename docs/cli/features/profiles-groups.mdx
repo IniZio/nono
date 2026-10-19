@@ -713,7 +713,9 @@ Groups use a structured allow/deny taxonomy:
 
 - **`java_runtime`** — Java runtime and build tool paths (SDKMAN, Maven, Gradle) ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L462))
 
-- **`nix_runtime`** — Nix package manager runtime paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L558))
+- **`nix_runtime`** — Nix package manager runtime paths ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L560))
+
+- **`nix_profile_state_write`** — Write access to `~/.local/state/nix/profiles` for `nix profile` mutations such as `nix profile add` ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L577))
 
 - **`user_tools`** — User-local executables, .desktop files, man pages, and shell completions ([source](https://github.com/nolabs-ai/nono/blob/main/crates/nono-cli/data/policy.json#L360))
 
