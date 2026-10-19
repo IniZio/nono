@@ -404,6 +404,14 @@
         ]
       }
     },
+    "rtk_state": {
+      "description": "rtk - history database and persisted state",
+      "allow": {
+        "readwrite": [
+          "~/.local/share/rtk"
+        ]
+      }
+    },
     "mise_manager": {
       "description": "Mise - dev tools, env vars, task runner",
       "allow": {

@@ -5089,6 +5089,29 @@ mod tests {
     }
 
     #[test]
+    fn test_rtk_state_group_grants_history_data_dir() {
+        let json = crate::config::embedded::embedded_policy_json();
+        let policy = load_policy(json).expect("parse policy.json");
+        let group = policy
+            .groups
+            .get("rtk_state")
+            .expect("rtk_state group must exist");
+        let allow = group
+            .allow
+            .as_ref()
+            .expect("rtk_state must have allow block");
+        assert!(
+            allow.readwrite.contains(&"~/.local/share/rtk".to_string()),
+            "rtk_state must grant read-write access to ~/.local/share/rtk \
+             so rtk can update history.db"
+        );
+        assert!(
+            allow.read.is_empty() && allow.write.is_empty(),
+            "rtk_state grants read-write only: history.db needs both to persist"
+        );
+    }
+
+    #[test]
     fn test_snap_linux_group_includes_snap_mount_paths() {
         let json = crate::config::embedded::embedded_policy_json();
         let policy = load_policy(json).expect("parse policy.json");
