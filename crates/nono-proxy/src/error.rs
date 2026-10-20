@@ -36,6 +36,10 @@ pub enum ProxyError {
     #[error("HTTP parse error: {0}")]
     HttpParse(String),
 
+    /// The client's request body ended early or was malformed.
+    #[error("Request body error: {0}")]
+    RequestBody(String),
+
     #[error("OAuth2 token exchange error: {0}")]
     OAuth2Exchange(String),
 
