@@ -1226,8 +1226,6 @@ where
         None
     };
 
-    // --- Read body (Content-Length only; chunked is rare in API requests
-    // and matches the existing reverse-proxy contract). ---
     // Passthrough (no route selected): drop the phantom credential header of
     // the host's credential routes so it never reaches the upstream.
     let strip_headers: Vec<String> = match (cred, service) {
@@ -1246,16 +1244,24 @@ where
         filtered_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("accept-encoding"));
         filtered_headers.push(("Accept-Encoding".to_string(), "identity".to_string()));
     }
-    let body =
-        match reverse::read_request_body(tls_stream, &req.header_bytes, &req.buffered).await? {
-            Some(b) => b,
-            None => return Ok(()),
-        };
-    let body = if let Some(endpoint) = oauth_endpoint {
-        ctx.oauth_capture_store
-            .rewrite_request_body(endpoint, &body)?
-    } else {
-        body
+    let oauth_body = match oauth_endpoint {
+        Some(endpoint) => {
+            match reverse::read_request_body(tls_stream, &req.header_bytes, &req.buffered).await? {
+                Some(read) => Some(
+                    ctx.oauth_capture_store
+                        .rewrite_request_body(endpoint, &read)?,
+                ),
+                None => return Ok(()),
+            }
+        }
+        None => None,
+    };
+    let body = match &oauth_body {
+        Some(bytes) => forward::RequestBody::Buffered(bytes),
+        None => forward::RequestBody::Inbound {
+            framing: reverse::request_body_framing(&req.header_bytes),
+            prefix: &req.buffered,
+        },
     };
 
     // --- Build upstream request bytes ---
@@ -1290,8 +1296,8 @@ where
         request.push_str(&format!("{}: {}\r\n", name, resolved_value));
     }
     request.push_str("Connection: close\r\n");
-    if !body.is_empty() {
-        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    if let Some(framing) = body.framing_header() {
+        request.push_str(&framing);
     }
     request.push_str("\r\n");
 
@@ -1386,31 +1392,38 @@ where
         .as_ref()
         .map(|rewrite| rewrite.as_ref() as forward::ResponseRewrite<'_>);
 
-    if let Err(e) = forward::forward_request_with_response_rewrite(
+    match forward::forward_request_with_response_rewrite(
         tls_stream,
         request.as_bytes(),
-        &body,
+        body,
         upstream_spec,
         audit_ctx,
         response_rewrite_ref,
     )
     .await
     {
-        warn!("tls_intercept: upstream forwarding failed: {}", e);
-        audit::log_denied(
-            ctx.audit_log,
-            audit::ProxyMode::ConnectIntercept,
-            &audit::EventContext {
-                denial_category: Some(
-                    nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
-                ),
-                ..event_ctx
-            },
-            ctx.host,
-            ctx.port,
-            &e.to_string(),
-        );
-        let _ = reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await;
+        Ok(_) => {}
+        Err(ProxyError::RequestBody(reason)) => {
+            warn!("tls_intercept: client request body failed: {}", reason);
+            let _ = reverse::send_error_generic(tls_stream, 400, "Bad Request").await;
+        }
+        Err(e) => {
+            warn!("tls_intercept: upstream forwarding failed: {}", e);
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::ConnectIntercept,
+                &audit::EventContext {
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
+                    ),
+                    ..event_ctx
+                },
+                ctx.host,
+                ctx.port,
+                &e.to_string(),
+            );
+            let _ = reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await;
+        }
     }
     Ok(())
 }
@@ -1524,11 +1537,10 @@ where
 
     let strip_header = inject_header.as_deref().unwrap_or("");
     let filtered_headers = reverse::filter_headers(&req.header_bytes, strip_header);
-    let body =
-        match reverse::read_request_body(tls_stream, &req.header_bytes, &req.buffered).await? {
-            Some(b) => b,
-            None => return Ok(()),
-        };
+    let body = forward::RequestBody::Inbound {
+        framing: reverse::request_body_framing(&req.header_bytes),
+        prefix: &req.buffered,
+    };
 
     let upstream_authority = reverse::format_host_header(UpstreamScheme::Https, ctx.host, ctx.port);
     let mut request = Zeroizing::new(format!(
@@ -1547,8 +1559,8 @@ where
         request.push_str(&format!("{}: {}\r\n", name, value));
     }
     request.push_str("Connection: close\r\n");
-    if !body.is_empty() {
-        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    if let Some(framing) = body.framing_header() {
+        request.push_str(&framing);
     }
     request.push_str("\r\n");
 
@@ -1579,30 +1591,37 @@ where
         method,
         path,
     };
-    if let Err(e) = forward::forward_request(
+    match forward::forward_request(
         tls_stream,
         request.as_bytes(),
-        &body,
+        body,
         upstream_spec,
         audit_ctx,
     )
     .await
     {
-        warn!("tls_intercept: SPIFFE upstream forwarding failed: {}", e);
-        audit::log_denied(
-            ctx.audit_log,
-            audit::ProxyMode::ConnectIntercept,
-            &audit::EventContext {
-                denial_category: Some(
-                    nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
-                ),
-                ..event_ctx
-            },
-            ctx.host,
-            ctx.port,
-            &e.to_string(),
-        );
-        let _ = reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await;
+        Ok(_) => {}
+        Err(ProxyError::RequestBody(reason)) => {
+            warn!("tls_intercept: client request body failed: {}", reason);
+            let _ = reverse::send_error_generic(tls_stream, 400, "Bad Request").await;
+        }
+        Err(e) => {
+            warn!("tls_intercept: SPIFFE upstream forwarding failed: {}", e);
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::ConnectIntercept,
+                &audit::EventContext {
+                    denial_category: Some(
+                        nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
+                    ),
+                    ..event_ctx
+                },
+                ctx.host,
+                ctx.port,
+                &e.to_string(),
+            );
+            let _ = reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await;
+        }
     }
     Ok(())
 }
@@ -1824,7 +1843,7 @@ where
     if let Err(e) = forward::forward_request(
         tls_stream,
         request.as_bytes(),
-        &body,
+        forward::RequestBody::Buffered(&body),
         upstream_spec,
         audit_ctx,
     )
