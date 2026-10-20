@@ -3883,6 +3883,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http1_audits_a_body_the_client_abandons_after_the_head_went_upstream() {
+        let mut request = upload_head("Content-Length: 100").into_bytes();
+        request.extend_from_slice(&[b'x'; 10]);
+        let (seen, audit, _) = h1_through_intercept(
+            true,
+            phantom_test_credential_store(),
+            |mut client, _| async move { client.write_all(&request).await.unwrap() },
+        )
+        .await;
+        assert!(
+            seen.head.contains("Authorization: token real\r\n"),
+            "{}",
+            seen.head
+        );
+        assert!(seen.body.len() < 100, "upstream got the whole body");
+        let request_events: Vec<_> = audit
+            .iter()
+            .filter(|event| event.endpoint_policy_action.is_none())
+            .collect();
+        assert_eq!(request_events.len(), 1, "{audit:?}");
+        let event = request_events[0];
+        assert_eq!(event.decision, nono::undo::NetworkAuditDecision::Allow);
+        assert_eq!(event.path.as_deref(), Some("/repos/mine/upload"));
+        assert_eq!(event.managed_credential_active, Some(true));
+        assert_eq!(event.status, None);
+    }
+
+    #[tokio::test]
     async fn http1_answers_400_to_a_malformed_chunked_body() {
         let mut request = upload_head("Transfer-Encoding: chunked").into_bytes();
         request.extend_from_slice(b"zz\r\nhello\r\n0\r\n\r\n");
