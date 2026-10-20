@@ -269,6 +269,7 @@ pub fn log_denied(
 
 /// Used for `Reverse` and `ConnectIntercept` modes. `External` and `Connect`
 /// (transparent tunnel) modes have no L7 visibility and use `log_allowed`/`log_denied`.
+/// `status` is `None` for a request that went upstream but got no response.
 pub fn log_l7_request(
     audit_log: Option<&SharedAuditLog>,
     mode: ProxyMode,
@@ -276,7 +277,7 @@ pub fn log_l7_request(
     target: &str,
     method: &str,
     path: &str,
-    status: u16,
+    status: Option<u16>,
 ) {
     info!(
         target: "nono_proxy::audit",
@@ -284,7 +285,7 @@ pub fn log_l7_request(
         target = target,
         method = method,
         path = path,
-        status = status,
+        status = ?status,
         "l7 proxy response"
     );
 
@@ -322,7 +323,7 @@ pub fn log_l7_request(
             port: None,
             method: Some(method.to_string()),
             path: Some(path.to_string()),
-            status: Some(status),
+            status,
             reason: None,
         },
     );
