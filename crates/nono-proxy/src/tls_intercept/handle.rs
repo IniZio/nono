@@ -3994,6 +3994,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http1_answers_400_to_malformed_body_framing() {
+        let mut accepted = Vec::new();
+        for (framing, body) in [
+            ("Content-Length: 5\r\nContent-Length: 6", "hello!"),
+            ("Content-Length: -1", ""),
+            ("Content-Length: +5", "hello"),
+            ("Content-Length: 18446744073709551616", "hello"),
+            ("Transfer-Encoding: gzip\r\nContent-Length: 5", "hello"),
+            (
+                "Transfer-Encoding: chunked, gzip",
+                "5\r\nhello\r\n0\r\n\r\n",
+            ),
+        ] {
+            let request = format!("{}{body}", upload_head(framing)).into_bytes();
+            let (seen, _, response) =
+                h1_through_intercept(true, phantom_test_credential_store(), |client, _| {
+                    send_and_read_response(client, request)
+                })
+                .await;
+            if !response.starts_with("HTTP/1.1 400") || !seen.head.is_empty() {
+                accepted.push(framing);
+            }
+        }
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[tokio::test]
     async fn http1_strips_phantom_header_on_unmatched_passthrough() {
         let seen = h1_upstream_request_text(
             true,
