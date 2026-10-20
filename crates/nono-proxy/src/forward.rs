@@ -12,7 +12,8 @@
 //!    bytes the caller holds, or bytes relayed from the inbound stream
 //!    through a fixed window so a body is never held whole.
 //! 3. Stream the response back into the inbound sink.
-//! 4. Emit one L7 audit event with the response status.
+//! 4. Emit one L7 audit event with the response status, or with no status
+//!    when the inbound body failed after the request head went upstream.
 //!
 //! ## Why pre-built request bytes
 //!
@@ -149,7 +150,8 @@ pub type ResponseRewrite<'a> =
 ///
 /// Returns the response status code (or 502 if the upstream sent something
 /// unparseable). A [`RequestBody::Inbound`] body that ends early or is
-/// malformed yields [`ProxyError::RequestBody`].
+/// malformed closes the upstream connection mid-request and yields
+/// [`ProxyError::RequestBody`].
 pub async fn forward_request<S>(
     inbound: &mut S,
     request_bytes: &[u8],
@@ -174,17 +176,36 @@ pub async fn forward_request_with_response_rewrite<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let status = match upstream.scheme {
+    let result = match upstream.scheme {
         UpstreamScheme::Https => {
             let mut tls_stream = open_https_upstream(&upstream).await?;
-            write_request(&mut tls_stream, inbound, request_bytes, body).await?;
-            stream_or_rewrite_response(&mut tls_stream, inbound, response_rewrite).await?
+            exchange(
+                &mut tls_stream,
+                inbound,
+                request_bytes,
+                body,
+                response_rewrite,
+            )
+            .await
         }
         UpstreamScheme::Http => {
             let mut tcp_stream = open_http_upstream(&upstream).await?;
-            write_request(&mut tcp_stream, inbound, request_bytes, body).await?;
-            stream_or_rewrite_response(&mut tcp_stream, inbound, response_rewrite).await?
+            exchange(
+                &mut tcp_stream,
+                inbound,
+                request_bytes,
+                body,
+                response_rewrite,
+            )
+            .await
         }
+    };
+    // The upstream stream is dropped by now, so a failed body never completes
+    // there; the head with any injected credential already went out.
+    let status = match &result {
+        Ok(status) => Some(*status),
+        Err(ProxyError::RequestBody(_)) => None,
+        Err(_) => return result,
     };
 
     audit::log_l7_request(
@@ -196,7 +217,22 @@ where
         audit.path,
         status,
     );
-    Ok(status)
+    result
+}
+
+async fn exchange<U, I>(
+    upstream: &mut U,
+    inbound: &mut I,
+    request: &[u8],
+    body: RequestBody<'_>,
+    response_rewrite: Option<ResponseRewrite<'_>>,
+) -> Result<u16>
+where
+    U: AsyncRead + AsyncWrite + Unpin,
+    I: AsyncRead + AsyncWrite + Unpin,
+{
+    write_request(upstream, inbound, request, body).await?;
+    stream_or_rewrite_response(upstream, inbound, response_rewrite).await
 }
 
 async fn stream_or_rewrite_response<U, I>(

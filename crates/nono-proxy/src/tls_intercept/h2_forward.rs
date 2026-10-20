@@ -608,7 +608,7 @@ async fn handle_h2_stream(
         &ctx.host,
         &method_str,
         &path,
-        status.as_u16(),
+        Some(status.as_u16()),
     );
 
     Ok(())

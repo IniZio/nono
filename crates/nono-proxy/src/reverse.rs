@@ -627,7 +627,7 @@ pub async fn handle_reverse_proxy(
                 &service,
                 &method,
                 &upstream_path,
-                status,
+                Some(status),
             );
         }
         Err(e) => {
@@ -1563,7 +1563,7 @@ async fn handle_oauth2_like(
                 service,
                 method,
                 upstream_path,
-                status,
+                Some(status),
             );
         }
         Err(e) => {

@@ -2188,7 +2188,7 @@ where
         ctx.host,
         &req.method,
         &req.path,
-        101,
+        Some(101),
     );
 
     tls_stream
