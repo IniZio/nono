@@ -627,7 +627,7 @@ pub async fn handle_reverse_proxy(
                 &service,
                 &method,
                 &upstream_path,
-                status,
+                Some(status),
             );
         }
         Err(e) => {
@@ -1563,7 +1563,7 @@ async fn handle_oauth2_like(
                 service,
                 method,
                 upstream_path,
-                status,
+                Some(status),
             );
         }
         Err(e) => {
@@ -1713,18 +1713,49 @@ pub(crate) fn should_reframe_with_content_length(header_bytes: &[u8]) -> bool {
     has_chunked_transfer_encoding(header_bytes) || extract_content_length(header_bytes).is_some()
 }
 
-/// The body framing the client declared, read the same way as
-/// [`read_request_body`]. Chunked wins over `Content-Length`, and a missing,
-/// invalid, or zero length means no body.
-pub(crate) fn request_body_framing(header_bytes: &[u8]) -> forward::BodyFraming {
-    if has_chunked_transfer_encoding(header_bytes) {
-        return forward::BodyFraming::Chunked;
+/// The body framing the client declared, per RFC 9112 section 6.3. A
+/// `Transfer-Encoding` overrides `Content-Length` and must end in `chunked`.
+/// Every `Content-Length` must be the same decimal number; zero means no body.
+pub(crate) fn request_body_framing(header_bytes: &[u8]) -> Result<forward::BodyFraming> {
+    let invalid = |reason: &str| ProxyError::HttpParse(reason.to_string());
+    let text =
+        std::str::from_utf8(header_bytes).map_err(|_| invalid("request headers are not UTF-8"))?;
+    let field_values = |wanted: &'static str| {
+        text.lines()
+            .filter_map(split_header_name_value)
+            .filter(move |(name, _)| name.eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| value.trim())
+    };
+
+    let mut transfer_encodings = field_values("transfer-encoding").peekable();
+    if transfer_encodings.peek().is_some() {
+        let final_coding = transfer_encodings
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .rfind(|coding| !coding.is_empty());
+        return match final_coding {
+            Some(coding) if coding.eq_ignore_ascii_case("chunked") => {
+                Ok(forward::BodyFraming::Chunked)
+            }
+            _ => Err(invalid("chunked is not the final transfer coding")),
+        };
     }
-    match extract_content_length(header_bytes).and_then(|len| std::num::NonZeroU64::new(len as u64))
-    {
-        Some(len) => forward::BodyFraming::ContentLength(len),
-        None => forward::BodyFraming::Empty,
+
+    let mut length = None;
+    for value in field_values("content-length") {
+        let parsed = match value.parse::<u64>() {
+            Ok(parsed) if value.bytes().all(|byte| byte.is_ascii_digit()) => parsed,
+            _ => return Err(invalid("invalid Content-Length")),
+        };
+        if length.is_some_and(|seen| seen != parsed) {
+            return Err(invalid("conflicting Content-Length values"));
+        }
+        length = Some(parsed);
     }
+    Ok(length.and_then(std::num::NonZeroU64::new).map_or(
+        forward::BodyFraming::Empty,
+        forward::BodyFraming::ContentLength,
+    ))
 }
 
 async fn read_chunked_request_body<S>(stream: &mut S, buffered_body: &[u8]) -> Result<Vec<u8>>

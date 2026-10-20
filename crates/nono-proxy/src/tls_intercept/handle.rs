@@ -1067,6 +1067,15 @@ where
             reverse::UpgradeAttempt::Valid => true,
         };
 
+    let framing = match reverse::request_body_framing(&req.header_bytes) {
+        Ok(framing) => framing,
+        Err(e) => {
+            warn!("tls_intercept: malformed request framing: {}", e);
+            reverse::send_error_generic(tls_stream, 400, "Bad Request").await?;
+            return Ok(());
+        }
+    };
+
     // Endpoint authorization + credential route selection. Shared with the
     // HTTP/2 path via [`select_intercept_route`] so the two protocols cannot
     // diverge in L7 policy enforcement.
@@ -1134,8 +1143,10 @@ where
     if route.is_some_and(|rt| rt.has_spiffe_source())
         && let (Some(svc), Some(rt)) = (service, route)
     {
-        return handle_spiffe_intercept_request(tls_stream, ctx, &req, svc, rt, &method, &path)
-            .await;
+        return handle_spiffe_intercept_request(
+            tls_stream, ctx, &req, framing, svc, rt, &method, &path,
+        )
+        .await;
     }
 
     // OAuth2 presence only affects the audit `managed_credential_active` flag
@@ -1259,7 +1270,7 @@ where
     let body = match &oauth_body {
         Some(bytes) => forward::RequestBody::Buffered(bytes),
         None => forward::RequestBody::Inbound {
-            framing: reverse::request_body_framing(&req.header_bytes),
+            framing,
             prefix: &req.buffered,
         },
     };
@@ -1433,6 +1444,7 @@ async fn handle_spiffe_intercept_request<S>(
     tls_stream: &mut S,
     ctx: &InterceptCtx<'_>,
     req: &ParsedRequest,
+    framing: forward::BodyFraming,
     service: &str,
     route: &crate::route::LoadedRoute,
     method: &str,
@@ -1538,7 +1550,7 @@ where
     let strip_header = inject_header.as_deref().unwrap_or("");
     let filtered_headers = reverse::filter_headers(&req.header_bytes, strip_header);
     let body = forward::RequestBody::Inbound {
-        framing: reverse::request_body_framing(&req.header_bytes),
+        framing,
         prefix: &req.buffered,
     };
 
@@ -2157,7 +2169,7 @@ where
         ctx.host,
         &req.method,
         &req.path,
-        101,
+        Some(101),
     );
 
     tls_stream
@@ -3578,14 +3590,14 @@ mod tests {
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth_line}\r\nAccept: application/json\r\nContent-Length: 0\r\n\r\n"
         );
-        let (seen, _) = h1_through_intercept(with_credential, credentials, |client, _| {
+        let (seen, _, _) = h1_through_intercept(with_credential, credentials, |client, _| {
             send_and_read_response(client, request.into_bytes())
         })
         .await;
         seen.head
     }
 
-    /// What the mock upstream read: the request head and the raw body bytes.
+    /// What the mock upstream read: the request head and every byte after it.
     /// Empty when the proxy never connected.
     #[derive(Default)]
     struct UpstreamSaw {
@@ -3608,12 +3620,13 @@ mod tests {
 
     /// Drive one HTTP/1.1 request through `handle_inner_request` to a mock TLS
     /// upstream behind the `gh` route. `client` plays the agent; it also gets
-    /// the count of body bytes the upstream has read so far.
+    /// the count of body bytes the upstream has read so far. Returns what the
+    /// upstream saw, the audit events, and the client's result.
     async fn h1_through_intercept<C, F, T>(
         with_credential: bool,
         credentials: CredentialStore,
         client: C,
-    ) -> (UpstreamSaw, T)
+    ) -> (UpstreamSaw, Vec<nono::undo::NetworkAuditEvent>, T)
     where
         C: FnOnce(tokio::io::DuplexStream, Arc<std::sync::atomic::AtomicUsize>) -> F,
         F: std::future::Future<Output = T> + Send + 'static,
@@ -3697,7 +3710,14 @@ mod tests {
             let _ = tls
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .await;
-            let _ = tls.flush().await;
+            let _ = tls.shutdown().await;
+            // Read on until the proxy closes so `body` holds every byte it sent.
+            loop {
+                match tls.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => body.extend_from_slice(&chunk[..n]),
+                }
+            }
             UpstreamSaw { head, body }
         });
 
@@ -3719,11 +3739,13 @@ mod tests {
         let route_store = RouteStore::load(&[phantom_test_route(port, with_credential)])
             .await
             .unwrap();
+        let audit_log = audit::new_audit_log();
         let mut ctx = test_intercept_ctx(&session_token, &connector, &filter);
         ctx.host = "localhost";
         ctx.port = port;
         ctx.route_store = Arc::new(route_store);
         ctx.credential_store = Arc::new(credentials);
+        ctx.audit_log = Some(&audit_log);
 
         let (agent_side, mut proxy_side) = tokio::io::duplex(64 * 1024);
         let agent = tokio::spawn(client(agent_side, received));
@@ -3738,9 +3760,13 @@ mod tests {
         let _ = handled_tx.send(());
         let seen = tokio::time::timeout(std::time::Duration::from_secs(5), upstream)
             .await
-            .unwrap()
+            .expect("upstream connection still open")
             .unwrap();
-        (seen, agent.await.unwrap())
+        (
+            seen,
+            audit::drain_audit_events(&audit_log),
+            agent.await.unwrap(),
+        )
     }
 
     fn upload_head(framing: &str) -> String {
@@ -3754,7 +3780,7 @@ mod tests {
         let len = reverse::MAX_REQUEST_BODY + 1024 * 1024;
         let mut request = upload_head(&format!("Content-Length: {len}")).into_bytes();
         request.resize(request.len() + len, b'x');
-        let (seen, response) =
+        let (seen, _, response) =
             h1_through_intercept(true, phantom_test_credential_store(), |client, _| {
                 send_and_read_response(client, request)
             })
@@ -3778,7 +3804,7 @@ mod tests {
     async fn http1_relays_body_bytes_before_the_client_finishes_sending() {
         use std::sync::atomic::Ordering;
         let half = 1024 * 1024;
-        let (seen, (streamed, response)) = h1_through_intercept(
+        let (seen, _, (streamed, response)) = h1_through_intercept(
             true,
             phantom_test_credential_store(),
             move |mut client, received| async move {
@@ -3808,12 +3834,23 @@ mod tests {
         assert_eq!(seen.body.len(), 2 * half);
     }
 
+    /// The `Content-Length` and `Transfer-Encoding` lines of a request head.
+    fn framing_lines(head: &str) -> Vec<&str> {
+        head.lines()
+            .filter(|line| {
+                let name = line.split(':').next().unwrap_or("").trim();
+                name.eq_ignore_ascii_case("content-length")
+                    || name.eq_ignore_ascii_case("transfer-encoding")
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn http1_relays_a_chunked_body_in_chunked_framing() {
         let mut request =
             upload_head("Transfer-Encoding: chunked\r\nContent-Length: 3").into_bytes();
         request.extend_from_slice(b"5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: 1\r\n\r\n");
-        let (seen, response) =
+        let (seen, _, response) =
             h1_through_intercept(true, phantom_test_credential_store(), |client, _| {
                 send_and_read_response(client, request)
             })
@@ -3824,29 +3861,104 @@ mod tests {
             "{}",
             seen.head
         );
-        assert!(
-            seen.head.contains("Transfer-Encoding: chunked\r\n"),
-            "{}",
-            seen.head
-        );
-        assert!(
-            !seen.head.to_ascii_lowercase().contains("content-length"),
-            "{}",
-            seen.head
-        );
+        assert_eq!(framing_lines(&seen.head), ["Transfer-Encoding: chunked"]);
         assert_eq!(seen.body, b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn http1_sends_only_its_own_chunked_framing_for_a_chunked_final_coding() {
+        let mut request =
+            upload_head("Transfer-Encoding: gzip, chunked\r\nContent-Length: 3").into_bytes();
+        request.extend_from_slice(b"5\r\nhello\r\n0\r\n\r\n");
+        let (seen, _, response) =
+            h1_through_intercept(true, phantom_test_credential_store(), |client, _| {
+                send_and_read_response(client, request)
+            })
+            .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(framing_lines(&seen.head), ["Transfer-Encoding: chunked"]);
+        assert_eq!(seen.body, b"5\r\nhello\r\n0\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn http1_never_relays_bytes_pipelined_after_a_content_length_body() {
+        let mut request = upload_head("Content-Length: 5").into_bytes();
+        request.extend_from_slice(b"helloGET /smuggled HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let (seen, _, response) =
+            h1_through_intercept(true, phantom_test_credential_store(), |client, _| {
+                send_and_read_response(client, request)
+            })
+            .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(framing_lines(&seen.head), ["Content-Length: 5"]);
+        assert_eq!(String::from_utf8_lossy(&seen.body), "hello");
+    }
+
+    #[tokio::test]
+    async fn http1_audits_a_body_the_client_abandons_after_the_head_went_upstream() {
+        let mut request = upload_head("Content-Length: 100").into_bytes();
+        request.extend_from_slice(&[b'x'; 10]);
+        let (seen, audit, _) = h1_through_intercept(
+            true,
+            phantom_test_credential_store(),
+            |mut client, _| async move { client.write_all(&request).await.unwrap() },
+        )
+        .await;
+        assert!(
+            seen.head.contains("Authorization: token real\r\n"),
+            "{}",
+            seen.head
+        );
+        assert!(seen.body.len() < 100, "upstream got the whole body");
+        let request_events: Vec<_> = audit
+            .iter()
+            .filter(|event| event.endpoint_policy_action.is_none())
+            .collect();
+        assert_eq!(request_events.len(), 1, "{audit:?}");
+        let event = request_events[0];
+        assert_eq!(event.decision, nono::undo::NetworkAuditDecision::Allow);
+        assert_eq!(event.path.as_deref(), Some("/repos/mine/upload"));
+        assert_eq!(event.managed_credential_active, Some(true));
+        assert_eq!(event.status, None);
     }
 
     #[tokio::test]
     async fn http1_answers_400_to_a_malformed_chunked_body() {
         let mut request = upload_head("Transfer-Encoding: chunked").into_bytes();
         request.extend_from_slice(b"zz\r\nhello\r\n0\r\n\r\n");
-        let (_, response) =
+        let (_, _, response) =
             h1_through_intercept(true, phantom_test_credential_store(), |client, _| {
                 send_and_read_response(client, request)
             })
             .await;
         assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn http1_answers_400_to_malformed_body_framing() {
+        let mut accepted = Vec::new();
+        for (framing, body) in [
+            ("Content-Length: 5\r\nContent-Length: 6", "hello!"),
+            ("Content-Length: -1", ""),
+            ("Content-Length: +5", "hello"),
+            ("Content-Length: 18446744073709551616", "hello"),
+            ("Transfer-Encoding: gzip\r\nContent-Length: 5", "hello"),
+            (
+                "Transfer-Encoding: chunked, gzip",
+                "5\r\nhello\r\n0\r\n\r\n",
+            ),
+        ] {
+            let request = format!("{}{body}", upload_head(framing)).into_bytes();
+            let (seen, _, response) =
+                h1_through_intercept(true, phantom_test_credential_store(), |client, _| {
+                    send_and_read_response(client, request)
+                })
+                .await;
+            if !response.starts_with("HTTP/1.1 400") || !seen.head.is_empty() {
+                accepted.push(framing);
+            }
+        }
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
     }
 
     #[tokio::test]
