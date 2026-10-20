@@ -1067,6 +1067,15 @@ where
             reverse::UpgradeAttempt::Valid => true,
         };
 
+    let framing = match reverse::request_body_framing(&req.header_bytes) {
+        Ok(framing) => framing,
+        Err(e) => {
+            warn!("tls_intercept: malformed request framing: {}", e);
+            reverse::send_error_generic(tls_stream, 400, "Bad Request").await?;
+            return Ok(());
+        }
+    };
+
     // Endpoint authorization + credential route selection. Shared with the
     // HTTP/2 path via [`select_intercept_route`] so the two protocols cannot
     // diverge in L7 policy enforcement.
@@ -1134,8 +1143,10 @@ where
     if route.is_some_and(|rt| rt.has_spiffe_source())
         && let (Some(svc), Some(rt)) = (service, route)
     {
-        return handle_spiffe_intercept_request(tls_stream, ctx, &req, svc, rt, &method, &path)
-            .await;
+        return handle_spiffe_intercept_request(
+            tls_stream, ctx, &req, framing, svc, rt, &method, &path,
+        )
+        .await;
     }
 
     // OAuth2 presence only affects the audit `managed_credential_active` flag
@@ -1259,7 +1270,7 @@ where
     let body = match &oauth_body {
         Some(bytes) => forward::RequestBody::Buffered(bytes),
         None => forward::RequestBody::Inbound {
-            framing: reverse::request_body_framing(&req.header_bytes),
+            framing,
             prefix: &req.buffered,
         },
     };
@@ -1433,6 +1444,7 @@ async fn handle_spiffe_intercept_request<S>(
     tls_stream: &mut S,
     ctx: &InterceptCtx<'_>,
     req: &ParsedRequest,
+    framing: forward::BodyFraming,
     service: &str,
     route: &crate::route::LoadedRoute,
     method: &str,
@@ -1538,7 +1550,7 @@ where
     let strip_header = inject_header.as_deref().unwrap_or("");
     let filtered_headers = reverse::filter_headers(&req.header_bytes, strip_header);
     let body = forward::RequestBody::Inbound {
-        framing: reverse::request_body_framing(&req.header_bytes),
+        framing,
         prefix: &req.buffered,
     };
 
