@@ -2223,7 +2223,15 @@ async fn handle_forward_http(
         path: &inbound_path,
     };
 
-    match forward::forward_request(stream, &request_bytes, &body, upstream, audit_ctx).await {
+    match forward::forward_request(
+        stream,
+        &request_bytes,
+        forward::RequestBody::Buffered(&body),
+        upstream,
+        audit_ctx,
+    )
+    .await
+    {
         Ok(_status) => Ok(()),
         Err(e) => {
             warn!("forward-http upstream connection failed: {}", e);

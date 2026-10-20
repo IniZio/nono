@@ -8,7 +8,9 @@
 //!
 //! 1. Establish an upstream byte stream — direct TCP (with optional TLS)
 //!    or chained CONNECT through an enterprise proxy (then TLS).
-//! 2. Write the pre-built HTTP/1.1 request bytes + body.
+//! 2. Write the pre-built HTTP/1.1 request bytes, then the body: either
+//!    bytes the caller holds, or bytes relayed from the inbound stream
+//!    through a fixed window so a body is never held whole.
 //! 3. Stream the response back into the inbound sink.
 //! 4. Emit one L7 audit event with the response status.
 //!
@@ -23,8 +25,9 @@
 use crate::audit;
 use crate::error::{ProxyError, Result};
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::debug;
@@ -32,6 +35,57 @@ use tracing::debug;
 /// Timeout for upstream TCP connect (matches the historical reverse-proxy value).
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_REWRITE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+const RELAY_WINDOW: usize = 64 * 1024;
+
+/// Cap on trailer lines after the last chunk of a chunked request (DoS bound).
+pub(crate) const MAX_CHUNK_TRAILER_LINES: usize = 64;
+
+/// How the client framed its request body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyFraming {
+    /// No body bytes follow the header block.
+    Empty,
+    /// `Content-Length` with this many bytes.
+    ContentLength(NonZeroU64),
+    /// `Transfer-Encoding: chunked`.
+    Chunked,
+}
+
+/// A request body for [`forward_request`] to write after the request bytes.
+/// No `Debug`: a buffered body can carry real credentials.
+pub enum RequestBody<'a> {
+    /// A body the caller already holds in full.
+    Buffered(&'a [u8]),
+    /// A body still arriving on the inbound stream in `framing`. `prefix`
+    /// holds the bytes already read past the header block.
+    Inbound {
+        framing: BodyFraming,
+        prefix: &'a [u8],
+    },
+}
+
+impl RequestBody<'_> {
+    /// The framing header line the upstream request needs for this body.
+    pub fn framing_header(&self) -> Option<String> {
+        match *self {
+            Self::Buffered([])
+            | Self::Inbound {
+                framing: BodyFraming::Empty,
+                ..
+            } => None,
+            Self::Buffered(bytes) => Some(format!("Content-Length: {}\r\n", bytes.len())),
+            Self::Inbound {
+                framing: BodyFraming::ContentLength(len),
+                ..
+            } => Some(format!("Content-Length: {len}\r\n")),
+            Self::Inbound {
+                framing: BodyFraming::Chunked,
+                ..
+            } => Some("Transfer-Encoding: chunked\r\n".to_string()),
+        }
+    }
+}
 
 /// Scheme of the upstream connection. `Http` is only legal for loopback
 /// targets; the caller is responsible for enforcing that invariant
@@ -94,11 +148,12 @@ pub type ResponseRewrite<'a> =
 /// response back into `inbound`, and emit the L7 audit event.
 ///
 /// Returns the response status code (or 502 if the upstream sent something
-/// unparseable).
+/// unparseable). A [`RequestBody::Inbound`] body that ends early or is
+/// malformed yields [`ProxyError::RequestBody`].
 pub async fn forward_request<S>(
     inbound: &mut S,
     request_bytes: &[u8],
-    body: &[u8],
+    body: RequestBody<'_>,
     upstream: UpstreamSpec<'_>,
     audit: AuditCtx<'_>,
 ) -> Result<u16>
@@ -111,7 +166,7 @@ where
 pub async fn forward_request_with_response_rewrite<S>(
     inbound: &mut S,
     request_bytes: &[u8],
-    body: &[u8],
+    body: RequestBody<'_>,
     upstream: UpstreamSpec<'_>,
     audit: AuditCtx<'_>,
     response_rewrite: Option<ResponseRewrite<'_>>,
@@ -122,12 +177,12 @@ where
     let status = match upstream.scheme {
         UpstreamScheme::Https => {
             let mut tls_stream = open_https_upstream(&upstream).await?;
-            write_request(&mut tls_stream, request_bytes, body).await?;
+            write_request(&mut tls_stream, inbound, request_bytes, body).await?;
             stream_or_rewrite_response(&mut tls_stream, inbound, response_rewrite).await?
         }
         UpstreamScheme::Http => {
             let mut tcp_stream = open_http_upstream(&upstream).await?;
-            write_request(&mut tcp_stream, request_bytes, body).await?;
+            write_request(&mut tcp_stream, inbound, request_bytes, body).await?;
             stream_or_rewrite_response(&mut tcp_stream, inbound, response_rewrite).await?
         }
     };
@@ -249,16 +304,156 @@ async fn connect_to_resolved(addrs: &[SocketAddr], host: &str) -> Result<TcpStre
     })
 }
 
-async fn write_request<S>(stream: &mut S, request: &[u8], body: &[u8]) -> Result<()>
+async fn write_request<U, I>(
+    upstream: &mut U,
+    inbound: &mut I,
+    request: &[u8],
+    body: RequestBody<'_>,
+) -> Result<()>
 where
-    S: AsyncWrite + Unpin,
+    U: AsyncWrite + Unpin,
+    I: AsyncRead + Unpin,
 {
-    stream.write_all(request).await?;
-    if !body.is_empty() {
-        stream.write_all(body).await?;
+    upstream.write_all(request).await?;
+    match body {
+        RequestBody::Buffered(bytes) => upstream.write_all(bytes).await?,
+        RequestBody::Inbound { framing, prefix } => {
+            let mut client = prefix.chain(inbound);
+            match framing {
+                BodyFraming::Empty => {}
+                BodyFraming::ContentLength(len) => {
+                    relay_exact(&mut client, upstream, len.get(), &mut vec![0; RELAY_WINDOW])
+                        .await?;
+                }
+                BodyFraming::Chunked => relay_chunks(BufReader::new(client), upstream).await?,
+            }
+        }
     }
-    stream.flush().await?;
+    upstream.flush().await?;
     Ok(())
+}
+
+async fn relay_exact<R, U>(
+    client: &mut R,
+    upstream: &mut U,
+    len: u64,
+    window: &mut [u8],
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    U: AsyncWrite + Unpin,
+{
+    let mut remaining = len;
+    while remaining > 0 {
+        let want = usize::try_from(remaining).map_or(window.len(), |r| r.min(window.len()));
+        let n = client
+            .read(&mut window[..want])
+            .await
+            .map_err(|e| ProxyError::RequestBody(format!("read failed: {e}")))?;
+        if n == 0 {
+            return Err(ProxyError::RequestBody(
+                "truncated request body".to_string(),
+            ));
+        }
+        upstream.write_all(&window[..n]).await?;
+        remaining -= n as u64;
+    }
+    Ok(())
+}
+
+/// Re-frame each chunk so the upstream sees only framing this proxy wrote.
+/// Chunk extensions and trailers are dropped.
+async fn relay_chunks<R, U>(mut client: R, upstream: &mut U) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    U: AsyncWrite + Unpin,
+{
+    let mut window = vec![0; RELAY_WINDOW];
+    loop {
+        let size = read_chunk_size(&mut client).await?;
+        if size == 0 {
+            skip_chunk_trailers(&mut client).await?;
+            upstream.write_all(b"0\r\n\r\n").await?;
+            return Ok(());
+        }
+        upstream
+            .write_all(format!("{size:x}\r\n").as_bytes())
+            .await?;
+        relay_exact(&mut client, upstream, size, &mut window).await?;
+        read_chunk_end(&mut client).await?;
+        upstream.write_all(b"\r\n").await?;
+    }
+}
+
+/// Read one chunk-size line of a chunked request body. Zero marks the last
+/// chunk.
+pub(crate) async fn read_chunk_size<R>(reader: &mut R) -> Result<u64>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = String::new();
+    let n = crate::line_reader::read_line_limited_string(
+        reader,
+        &mut line,
+        crate::line_reader::MAX_LINE_SIZE,
+    )
+    .await
+    .map_err(|e| ProxyError::RequestBody(format!("chunk size line: {e}")))?;
+    if n == 0 {
+        return Err(ProxyError::RequestBody(
+            "truncated chunked request".to_string(),
+        ));
+    }
+    let size_text = line.trim_end().split(';').next().unwrap_or("");
+    u64::from_str_radix(size_text.trim(), 16)
+        .map_err(|_| ProxyError::RequestBody("invalid chunk size".to_string()))
+}
+
+/// Read the CRLF that ends a chunk's data.
+pub(crate) async fn read_chunk_end<R>(reader: &mut R) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut crlf = [0u8; 2];
+    reader
+        .read_exact(&mut crlf)
+        .await
+        .map_err(|e| ProxyError::RequestBody(format!("truncated chunked request body: {e}")))?;
+    if crlf != *b"\r\n" {
+        return Err(ProxyError::RequestBody(
+            "malformed chunk data terminator".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Read and discard the trailer section after the last chunk. More than
+/// [`MAX_CHUNK_TRAILER_LINES`] lines is an error.
+pub(crate) async fn skip_chunk_trailers<R>(reader: &mut R) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+{
+    for _ in 0..=MAX_CHUNK_TRAILER_LINES {
+        let mut trailer = String::new();
+        let n = crate::line_reader::read_line_limited_string(
+            reader,
+            &mut trailer,
+            crate::line_reader::MAX_LINE_SIZE,
+        )
+        .await
+        .map_err(|e| ProxyError::RequestBody(format!("chunk trailer line: {e}")))?;
+        if n == 0 {
+            return Err(ProxyError::RequestBody(
+                "truncated chunked request trailers".to_string(),
+            ));
+        }
+        if trailer == "\r\n" || trailer == "\n" {
+            return Ok(());
+        }
+    }
+    Err(ProxyError::RequestBody(
+        "too many chunked request trailers".to_string(),
+    ))
 }
 
 /// Stream the upstream response back to the inbound sink.

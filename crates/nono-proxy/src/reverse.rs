@@ -36,7 +36,7 @@ use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
 /// Maximum request body size (16 MiB). Prevents DoS from malicious Content-Length.
-const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_REQUEST_BODY: usize = 16 * 1024 * 1024;
 
 pub(crate) fn auth_mechanism_for_inject_mode(
     mode: &InjectMode,
@@ -910,8 +910,14 @@ async fn handle_spiffe_route(
         method,
         path: upstream_path,
     };
-    if let Err(e) =
-        forward::forward_request(stream, request.as_bytes(), &body, upstream_spec, audit_ctx).await
+    if let Err(e) = forward::forward_request(
+        stream,
+        request.as_bytes(),
+        forward::RequestBody::Buffered(&body),
+        upstream_spec,
+        audit_ctx,
+    )
+    .await
     {
         warn!("SPIFFE upstream connection failed: {}", e);
         send_error(stream, 502, "Bad Gateway").await?;
@@ -1707,87 +1713,47 @@ pub(crate) fn should_reframe_with_content_length(header_bytes: &[u8]) -> bool {
     has_chunked_transfer_encoding(header_bytes) || extract_content_length(header_bytes).is_some()
 }
 
-/// Cap on trailer header lines after the final `0` chunk (DoS bound).
-const MAX_CHUNK_TRAILER_LINES: usize = 64;
+/// The body framing the client declared, read the same way as
+/// [`read_request_body`]. Chunked wins over `Content-Length`, and a missing,
+/// invalid, or zero length means no body.
+pub(crate) fn request_body_framing(header_bytes: &[u8]) -> forward::BodyFraming {
+    if has_chunked_transfer_encoding(header_bytes) {
+        return forward::BodyFraming::Chunked;
+    }
+    match extract_content_length(header_bytes).and_then(|len| std::num::NonZeroU64::new(len as u64))
+    {
+        Some(len) => forward::BodyFraming::ContentLength(len),
+        None => forward::BodyFraming::Empty,
+    }
+}
 
 async fn read_chunked_request_body<S>(stream: &mut S, buffered_body: &[u8]) -> Result<Vec<u8>>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    let prefix = std::io::Cursor::new(buffered_body.to_vec());
-    let chained = prefix.chain(stream);
-    let mut reader = BufReader::new(chained);
+    let mut reader = BufReader::new(buffered_body.chain(stream));
     let mut out = Vec::new();
-    let mut total = 0usize;
     loop {
-        let mut size_line = String::new();
-        if crate::line_reader::read_line_limited_string(
-            &mut reader,
-            &mut size_line,
-            crate::line_reader::MAX_LINE_SIZE,
-        )
-        .await?
-            == 0
-        {
-            return Err(ProxyError::HttpParse(
-                "truncated chunked request".to_string(),
-            ));
+        let size = forward::read_chunk_size(&mut reader).await?;
+        if size == 0 {
+            forward::skip_chunk_trailers(&mut reader).await?;
+            return Ok(out);
         }
-        let size_text = size_line.trim_end().split(';').next().unwrap_or("");
-        let size = usize::from_str_radix(size_text.trim(), 16)
-            .map_err(|_| ProxyError::HttpParse("invalid chunk size".to_string()))?;
-        total = total
+        let total = (out.len() as u64)
             .checked_add(size)
             .ok_or_else(|| ProxyError::HttpParse("chunked request size overflow".to_string()))?;
-        if total > MAX_REQUEST_BODY {
+        if total > MAX_REQUEST_BODY as u64 {
             return Err(ProxyError::HttpParse(
                 "chunked request exceeds size limit".to_string(),
             ));
         }
-        if size > 0 {
-            let mut chunk = vec![0u8; size];
-            reader.read_exact(&mut chunk).await.map_err(|e| {
-                ProxyError::HttpParse(format!("truncated chunked request body: {e}"))
-            })?;
-            let mut crlf = [0u8; 2];
-            reader.read_exact(&mut crlf).await.map_err(|e| {
-                ProxyError::HttpParse(format!("truncated chunked request body: {e}"))
-            })?;
-            if crlf != *b"\r\n" {
-                return Err(ProxyError::HttpParse(
-                    "malformed chunk data terminator".to_string(),
-                ));
-            }
-            out.extend_from_slice(&chunk);
-            continue;
-        }
-        let mut trailer_lines = 0usize;
-        loop {
-            let mut trailer = String::new();
-            if crate::line_reader::read_line_limited_string(
-                &mut reader,
-                &mut trailer,
-                crate::line_reader::MAX_LINE_SIZE,
-            )
-            .await?
-                == 0
-            {
-                return Err(ProxyError::HttpParse(
-                    "truncated chunked request trailers".to_string(),
-                ));
-            }
-            if trailer == "\r\n" || trailer == "\n" {
-                return Ok(out);
-            }
-            trailer_lines = trailer_lines.checked_add(1).ok_or_else(|| {
-                ProxyError::HttpParse("chunked request trailer count overflow".to_string())
-            })?;
-            if trailer_lines > MAX_CHUNK_TRAILER_LINES {
-                return Err(ProxyError::HttpParse(
-                    "too many chunked request trailers".to_string(),
-                ));
-            }
-        }
+        let start = out.len();
+        out.resize(total as usize, 0);
+        reader
+            .read_exact(&mut out[start..])
+            .await
+            .map_err(|e| ProxyError::RequestBody(format!("truncated chunked request body: {e}")))?;
+        forward::read_chunk_end(&mut reader).await?;
     }
 }
 
@@ -3571,7 +3537,7 @@ mod tests {
     async fn read_request_body_rejects_excessive_trailers() {
         let headers = b"Transfer-Encoding: chunked\r\n\r\n";
         let mut payload = String::from("0\r\n");
-        for i in 0..=MAX_CHUNK_TRAILER_LINES {
+        for i in 0..=forward::MAX_CHUNK_TRAILER_LINES {
             payload.push_str(&format!("X-Trailer-{i}: 1\r\n"));
         }
         payload.push_str("\r\n");
