@@ -1265,29 +1265,8 @@ fn parse_capture_headers_json(
     Ok(result)
 }
 
-fn is_http_token_char(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-        || matches!(
-            c,
-            '!' | '#'
-                | '$'
-                | '%'
-                | '&'
-                | '\''
-                | '*'
-                | '+'
-                | '-'
-                | '.'
-                | '^'
-                | '_'
-                | '`'
-                | '|'
-                | '~'
-        )
-}
-
 fn is_safe_capture_header_name(name: &str) -> bool {
-    if name.is_empty() || !name.chars().all(is_http_token_char) {
+    if !nono_proxy::config::is_http_header_token(name) {
         return false;
     }
     !matches!(

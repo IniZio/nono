@@ -486,28 +486,6 @@ fn default_inject_header() -> String {
     "Authorization".to_string()
 }
 
-/// Check if a character is a valid HTTP header token character.
-fn is_http_token_char(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-        || matches!(
-            c,
-            '!' | '#'
-                | '$'
-                | '%'
-                | '&'
-                | '\''
-                | '*'
-                | '+'
-                | '-'
-                | '.'
-                | '^'
-                | '_'
-                | '`'
-                | '|'
-                | '~'
-        )
-}
-
 /// Validate a credential key.
 ///
 /// Accepts either:
@@ -778,7 +756,7 @@ fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()>
                     name
                 )));
             }
-            if !header.chars().all(is_http_token_char) {
+            if !nono_proxy::config::is_http_header_token(header) {
                 return Err(NonoError::ProfileParse(format!(
                     "proxy.inject_header '{}' for custom credential '{}' contains invalid characters; \
                      header names must be valid HTTP tokens (alphanumeric and !#$%&'*+-.^_`|~)",
@@ -993,7 +971,7 @@ fn validate_header_name(cred_name: &str, header: &str) -> Result<()> {
             cred_name
         )));
     }
-    if !header.chars().all(is_http_token_char) {
+    if !nono_proxy::config::is_http_header_token(header) {
         return Err(NonoError::ProfileParse(format!(
             "inject_header '{}' for custom credential '{}' contains invalid characters; \
              header names must be valid HTTP tokens (alphanumeric and !#$%&'*+-.^_`|~)",
@@ -1011,7 +989,7 @@ fn validate_header_mode(name: &str, cred: &CustomCredentialDef) -> Result<()> {
             name
         )));
     }
-    if !cred.inject_header.chars().all(is_http_token_char) {
+    if !nono_proxy::config::is_http_header_token(&cred.inject_header) {
         return Err(NonoError::ProfileParse(format!(
             "inject_header '{}' for custom credential '{}' contains invalid characters; \
              header names must be valid HTTP tokens (alphanumeric and !#$%&'*+-.^_`|~)",
@@ -1519,7 +1497,7 @@ fn validate_credential_capture_entries(profile: &Profile) -> Result<()> {
 }
 
 fn is_safe_capture_header_name(name: &str) -> bool {
-    if name.is_empty() || !name.chars().all(is_http_token_char) {
+    if !nono_proxy::config::is_http_header_token(name) {
         return false;
     }
     !matches!(
@@ -5601,37 +5579,6 @@ mod tests {
 
         let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
         assert_eq!(profile.workdir.access, WorkdirAccess::None);
-    }
-
-    // ============================================================================
-    // is_http_token_char tests
-    // ============================================================================
-
-    #[test]
-    fn test_http_token_char_alphanumeric() {
-        assert!(is_http_token_char('a'));
-        assert!(is_http_token_char('Z'));
-        assert!(is_http_token_char('0'));
-        assert!(is_http_token_char('9'));
-    }
-
-    #[test]
-    fn test_http_token_char_special_chars() {
-        // valid special chars in header token names: !#$%&'*+-.^_`|~
-        for c in "!#$%&'*+-.^_`|~".chars() {
-            assert!(is_http_token_char(c), "Expected '{}' to be valid tchar", c);
-        }
-    }
-
-    #[test]
-    fn test_http_token_char_rejects_invalid() {
-        // Control chars, space, colon, parentheses should be rejected
-        assert!(!is_http_token_char(' '));
-        assert!(!is_http_token_char(':'));
-        assert!(!is_http_token_char('('));
-        assert!(!is_http_token_char(')'));
-        assert!(!is_http_token_char('\r'));
-        assert!(!is_http_token_char('\n'));
     }
 
     // ============================================================================
