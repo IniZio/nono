@@ -8,7 +8,8 @@
 //! ## Properties
 //!
 //! * Algorithm: ECDSA P-256 (matches the rustls/ring stack already in use)
-//! * Validity: 24 hours from generation. Long enough to outlive any plausible
+//! * Validity: 24 hours from generation, with `not_before` backdated one day
+//!   to tolerate a lagging peer clock. Long enough to outlive any plausible
 //!   `nono` invocation; short enough that a leaked cert file becomes useless
 //!   quickly.
 //! * Subject: `CN=nono-session-ca`
@@ -36,6 +37,14 @@ use zeroize::Zeroizing;
 /// Default validity window for the ephemeral CA (1 day). Long enough to cover
 /// any plausible session, short enough to limit blast radius if the cert file leaks.
 pub const CA_VALIDITY_DEFAULT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How far `not_before` is moved into the past for the CA and every leaf.
+///
+/// A sandbox whose clock runs behind the host (a fresh VM before NTP syncs)
+/// would otherwise reject certificates as not yet valid. mitmproxy backdates
+/// its CA and leaves by two days for the same reason
+/// (`CERT_VALIDITY_OFFSET` in `mitmproxy/certs.py`).
+pub(crate) const CERT_BACKDATE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Ephemeral CA used to sign per-hostname leaf certificates for TLS interception.
 ///
@@ -139,7 +148,7 @@ impl EphemeralCa {
 
         let now = SystemTime::now();
         let not_after = now + validity;
-        params.not_before = system_time_to_offset(now)?;
+        params.not_before = system_time_to_offset(now - CERT_BACKDATE)?;
         params.not_after = system_time_to_offset(not_after)?;
 
         let mut dn = DistinguishedName::new();
