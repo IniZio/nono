@@ -22,7 +22,7 @@
 //! tunnel for a route that asked for L7 visibility.
 
 use crate::error::{ProxyError, Result};
-use crate::tls_intercept::ca::EphemeralCa;
+use crate::tls_intercept::ca::{CERT_BACKDATE, EphemeralCa};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
     PKCS_ECDSA_P256_SHA256, SanType,
@@ -167,7 +167,7 @@ fn mint_leaf(
         .and_then(|validity| now.checked_add(validity))
         .map(|requested| requested.min(ca_not_after))
         .unwrap_or(ca_not_after);
-    params.not_before = system_time_to_offset(now)?;
+    params.not_before = system_time_to_offset(now - CERT_BACKDATE)?;
     params.not_after = system_time_to_offset(leaf_not_after)?;
 
     let mut dn = DistinguishedName::new();
@@ -317,6 +317,34 @@ mod tests {
             leaf_not_after >= now + 30 && leaf_not_after <= now + 90,
             "leaf_not_after={leaf_not_after}, now={now}"
         );
+    }
+
+    #[test]
+    fn minted_leaf_verifies_with_verifier_clock_five_minutes_behind() {
+        use rustls::RootCertStore;
+        use rustls::client::WebPkiServerVerifier;
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{ServerName, UnixTime};
+
+        let cache = fresh_cache();
+        let ck = cache.get_or_mint("api.example.com").unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(ck.cert[1].clone()).unwrap();
+        let verifier = WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let behind = UnixTime::since_unix_epoch(now - Duration::from_secs(5 * 60));
+        let name = ServerName::try_from("api.example.com").unwrap();
+        verifier
+            .verify_server_cert(&ck.cert[0], &[], &name, &[], behind)
+            .expect("leaf minted now must verify against a clock 5 minutes behind");
     }
 
     #[test]
